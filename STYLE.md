@@ -412,25 +412,28 @@ interface IFoo {
 }
 ```
 
-### Inside functions **[convention]**
+### Inside functions **[enforced]**
 
-- Blank line between logical groupings inside a function body
-- No blank line directly after `{` or before `}`  inside a function
-- Related statements grouped together without blank lines
+- No blank line directly after `{` or before `}` inside a function
+- **Adjacent statements that are not "alignable together" are separated by a blank line.** Two
+  statements are alignable iff they're the same kind that the formatter aligns into a column —
+  variable declarations, plain assignments, `require`s, or same-arity calls. Anything else (an
+  `emit`, a `return`, a multi-line statement, a control block, or a *different* kind) gets a blank.
+- Same-kind statements are grouped with no blank and aligned (e.g. a run of `address` declarations).
+- Exception: tightly-coupled idioms stay glued — e.g. an assignment and the `emit` that publishes it,
+  or a `require` and the guard/assignment that consumes the checked value.
 
 ```solidity
 function deposit(address aToken, uint256 amount) external nonReentrant onlyRole(RELAYER_ROLE) {
-    SharedControllerStorage storage $ = _getSharedControllerStorage();
-
-    address proxy = $.proxy;
-
-    _decreaseRateLimit($.rateLimits, LIMIT_DEPOSIT, aToken, amount);
-
     uint256 maxSlippage = _getFacetStorage().maxSlippages[aToken];
+
     require(maxSlippage != 0, "AaveFacet/max-slippage-not-set");
 
-    address underlying = IATokenWithPoolLike(aToken).UNDERLYING_ASSET_ADDRESS();
+    address proxy      = _getSharedControllerStorage().proxy;
     address pool       = IATokenWithPoolLike(aToken).POOL();
+    address underlying = IATokenWithPoolLike(aToken).UNDERLYING_ASSET_ADDRESS();
+
+    _decreaseRateLimit(getDepositRateLimitKey(aToken, pool, underlying), amount);
 
     ApproveLib.approve(underlying, proxy, pool, amount);
     ...
@@ -519,8 +522,12 @@ function getDispatch(bytes4 callSelector)
 
 ### Multi-line parameters **[convention]**
 
-When a parameter list itself is multi-line, each param on its own line, indented 4 extra spaces
-relative to `function`:
+Parameters are only wrapped one-per-line when they are genuinely long (the full single-line
+signature exceeds the line limit, or there are 3+ parameters). A short signature (≤ 2 params) whose
+parameters fit keeps them **inline** on the `function name(...)` line — `weld format` pulls wrapped
+short params back inline and stacks the remaining modifiers (see the `removeAllocator`/
+`triggerRateLimitDecrease` style). When a parameter list *is* multi-line, each param goes on its own
+line, indented 4 extra spaces relative to `function`:
 
 ```solidity
 function setRateLimitData(
@@ -599,8 +606,8 @@ require(admin != address(0), ZeroAdmin());
 require(facet != address(0), DispatchNotFound(msg.sig));
 
 // ✓ also accepted — string format "Contract/error-description"
-require(maxSlippage != 0, "AaveFacet/max-slippage-not-set");
-require(pool != address(0), "CurveFacet/pool-zero-address");
+require(maxSlippage != 0,          "AaveFacet/max-slippage-not-set");
+require(pool        != address(0), "CurveFacet/pool-zero-address");
 ```
 
 String format (where used) is `"ContractName/kebab-case-description"`.
@@ -1124,6 +1131,7 @@ These are applied by `weld format` but are not separately reported by `weld lint
 | Line wrap at 120 | over-length function/event/error declarations are split; wrapped ones collapse only when ≤ 90 |
 | struct/field comment alignment | trailing `//` comments on a run of typed fields align into a column when 2+ are present |
 | consecutive call alignment | runs of same-callee single-line calls align their argument columns (source files only; not `.t.sol`) |
+| statement grouping | a blank line is inserted between adjacent function-body statements that are not alignable together (e.g. a `require` next to a variable declaration); same-class runs stay grouped. Insert-only; source files only |
 | struct-literal colon | named-argument blocks aligned as `key : value` (space before the colon) |
 | type/modifier columns | declaration `type` and modifier (e.g. `indexed`) aligned as two columns |
 | require alignment | error column aligned; operands aligned only when all conditions share one operator |

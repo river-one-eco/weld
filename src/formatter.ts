@@ -32,6 +32,8 @@ let cfg = { ...FORMAT_DEFAULTS };
 
 export function format(content: string, filePath: string, opts?: FormatOptions): FormatResult {
   cfg = { ...FORMAT_DEFAULTS, ...(opts ?? {}) };
+  // Nothing to format in an empty / whitespace-only file — leave it untouched.
+  if (content.trim() === '') return { content, changed: false, fixes: [] };
   // Test code (incl. `.sol` mocks/helpers under a test/ dir) follows looser, judgment-based blank-line
   // and alignment conventions in the canonical corpus, so structural passes skip it.
   const isTestFile = filePath.endsWith('.t.sol') || /(^|\/)test\//.test(filePath);
@@ -51,7 +53,7 @@ export function format(content: string, filePath: string, opts?: FormatOptions):
   src = normalizeLineCommentSpace(src, fixes); // `//text` → `// text`
   src = convertNatSpecRuns(src, fixes);       // multi-tag `///` run → `/** */` block
   src = alignNatSpec(src, fixes);             // align @param/@return/@dev columns in `/** */` blocks
-  src = collapseFunctionDecls(src, fixes);    // multi-line → single when short; before the wrap pass
+  src = collapseFunctionDecls(src, fixes, isTestFile); // multi-line → single when short; before the wrap pass
   src = normalizeFunctionDecls(src, fixes);   // must run before alignTypeNameGroups
   src = expandPackedModifierSignatures(src, fixes); // wrapped-param sig + complex modifier → stack modifiers
   src = normalizeEventErrorDecls(src, fixes); // must run before alignTypeNameGroups
@@ -66,6 +68,7 @@ export function format(content: string, filePath: string, opts?: FormatOptions):
   src = normalizeTernaryReturn(src, fixes);              // `return <cond>` + ?/: → return alone, cond +4, ?/: +8
   src = separateMemberDecls(src, fixes, isTestFile);     // blank line between glued member declarations
   src = normalizeDeclBodyBlanks(src, fixes, isTestFile); // blank line after `{` and before `}` of a decl body
+  src = separateUnalignableStatements(src, fixes, isTestFile); // blank between non-alignable adjacent statements
   src = normalizeBlankLines(src, fixes, isTestFile);
   src = ensureBlankBeforeComments(src, fixes, isTestFile);
   src = normalizeEof(src, fixes);             // run last: exactly one terminating newline
@@ -636,7 +639,46 @@ function _normalizeFuncToSingleLine(indent: string, sigText: string): string | n
   return s;
 }
 
-function collapseFunctionDecls(src: string, fixes: string[]): string {
+// Render "Form 2": parameters inline on the `function name(...)` line, each modifier / returns on its
+// own line, and the opening `{` (or `;`) on its own. Used when the full single-line is too long but
+// the params themselves fit — canonical never wraps short parameters one-per-line.
+function _normalizeFuncToFormTwo(indent: string, sigText: string): string[] | null {
+  const fm = sigText.match(/^function\s+(\w+)\(/);
+  if (!fm) return null;
+  let pos = fm[0].length, depth = 1;
+  while (pos < sigText.length && depth > 0) {
+    if (sigText[pos] === '(') depth++;
+    else if (sigText[pos] === ')') { if (--depth === 0) break; }
+    pos++;
+  }
+  if (depth !== 0) return null;
+  const params = sigText.slice(fm[0].length, pos).trim()
+    ? _splitTopLevelCommas(sigText.slice(fm[0].length, pos)).map(p => p.trim()).filter(Boolean)
+    : [];
+  const parsed = _parseFuncRest(sigText.slice(pos + 1));
+  if (!parsed) return null;
+  const { modifiers, returnsType, end } = parsed;
+
+  // Only stack when a COMPLEX modifier is present (override/virtual/named like onlyRole, initializer).
+  // Plain visibility/mutability/returns stay packed on the `)` line (handled elsewhere), matching
+  // canonical — so we don't reflow `) external view returns (…)` into a stack.
+  if (!modifiers.some(mod => !PLAIN_MODIFIERS.has(mod.replace(/\(.*$/, '')))) return null;
+
+  const items = [...modifiers];
+  if (returnsType !== null) items.push('returns (' + returnsType + ')');
+  const inner = indent + '    ';
+  const out = [`${indent}function ${fm[1]}(${params.join(', ')})`];
+  if (end === '{') {
+    for (const it of items) out.push(inner + it);
+    out.push(`${indent}{`);
+  } else {
+    for (let k = 0; k < items.length; k++) out.push(inner + items[k] + (k === items.length - 1 ? ';' : ''));
+    if (items.length === 0) out[out.length - 1] += ';';
+  }
+  return out;
+}
+
+function collapseFunctionDecls(src: string, fixes: string[], isTestFile: boolean): string {
   const lines = src.split('\n');
   let changed = false;
   let i = 0;
@@ -686,9 +728,27 @@ function collapseFunctionDecls(src: string, fixes: string[]): string {
       lines.splice(i, block.length, finalLine);
       changed = true;
       i += 1;
-    } else {
-      i = endLine + 1;
+      continue;
     }
+
+    // Too long for one line — but if the WHOLE signature would fit within the line limit (so the
+    // params aren't genuinely long), pull the params back inline and keep modifiers stacked (Form 2).
+    // Canonical only wraps params one-per-line when the full single-line exceeds the limit.
+    // Form-2 param inlining is a structural reflow — source files only (test mocks pack modifiers
+    // more loosely). Only inline params for short (≤ 2 param) signatures; canonical wraps 3+ params
+    // one-per-line even when the full signature would fit.
+    const formTwo = isTestFile ? null : _normalizeFuncToFormTwo(m[1], sigText);
+    const pstr = formTwo ? formTwo[0].slice(formTwo[0].indexOf('(') + 1, formTwo[0].lastIndexOf(')')) : '';
+    const paramCount = pstr.trim() === '' ? 0 : _splitTopLevelCommas(pstr).length;
+    if (formTwo && paramCount <= 2 && finalLine.length <= cfg.lineLength && formTwo.join('\n') !== block.join('\n')) {
+      if (trailing.startsWith('//')) formTwo[formTwo.length - 1] += ' ' + trailing;
+      lines.splice(i, block.length, ...formTwo);
+      changed = true;
+      i += formTwo.length;
+      continue;
+    }
+
+    i = endLine + 1;
   }
 
   if (changed) fixes.push('Collapsed short function declarations');
@@ -1665,6 +1725,223 @@ function separateMemberDecls(src: string, fixes: string[], isTestFile: boolean):
   }
   if (changed) fixes.push('Separated member declarations');
   return lines.join('\n');
+}
+
+// ---------------------------------------------------------------------------
+// 13e. Blank line between adjacent function-body statements that are NOT "alignable together".
+//   Two statements are alignable iff same class ∈ {VARDECL, ASSIGN, REQUIRE, CALL-of-same-arity};
+//   anything else (or a SINGLETON: emit/return/revert/multi-line stmt/control block) is not. When
+//   two adjacent statements aren't alignable (and aren't a tight-coupling idiom), canonical separates
+//   them with a blank line. Insert-only (never removes author blanks); source files only.
+// ---------------------------------------------------------------------------
+
+const STMT_CALL_CTRL = new Set([
+  'require', 'revert', 'return', 'if', 'for', 'while', 'catch', 'emit', 'else', 'do', 'try',
+  'assembly', 'unchecked', 'new',
+]);
+
+interface StmtNode {
+  cls: 'VARDECL' | 'ASSIGN' | 'REQUIRE' | 'CALL' | 'SINGLETON';
+  key: string;
+  writeIdent: string;
+  firstTrim: string;
+  text: string;
+}
+
+// Bracket balance of a single line's code (ignores // comments and string literals).
+function _bracketDelta(line: string): number {
+  let depth = 0, q = '';
+  for (let k = 0; k < line.length; k++) {
+    const c = line[k];
+    if (q) { if (c === q && line[k - 1] !== '\\') q = ''; continue; }
+    if (c === '"' || c === "'") { q = c; continue; }
+    if (c === '/' && line[k + 1] === '/') break;
+    if (c === '(' || c === '[' || c === '{') depth++;
+    else if (c === ')' || c === ']' || c === '}') depth--;
+  }
+  return depth;
+}
+
+// Classify a single-line statement. `multiLine` forces SINGLETON (no single-line align applies).
+function _classifyStmt(line: string, multiLine: boolean): StmtNode {
+  const code = line.replace(/\/\/.*$/, '').trimEnd(); // ignore any trailing line comment
+  const firstTrim = code.trim();
+  const text = code;
+  const single = (cls: StmtNode['cls'], key: string, writeIdent = '') => ({ cls, key, writeIdent, firstTrim, text });
+  if (multiLine) return { cls: 'SINGLETON', key: 'SINGLETON', writeIdent: '', firstTrim: line.trim(), text: line };
+
+  // VARDECL (broadened: $-names, []-types, data location) — `type name = …;`
+  let m = code.match(/^\s*[A-Za-z_]\w*(?:\[\])*(?:\s+(?:memory|storage|calldata))?\s+([A-Za-z_$]\w*)\s*=(?!=)\s*.+;$/);
+  if (m && !_isChainedAssignment(code)) return single('VARDECL', 'VARDECL', m[1]);
+
+  // ASSIGN — `lhs = …;` (single LHS; chained `a = b = c;` is still an assignment for grouping).
+  if (PURE_ASSIGN_RE.test(code) && /;$/.test(code)) {
+    const mm = code.match(/^\s*([A-Za-z_$][\w.[\]]*)\s*=/);
+    return single('ASSIGN', 'ASSIGN', mm ? mm[1].split(/[.[]/)[0] : '');
+  }
+
+  if (/^\s*require\(.+\);$/.test(code)) return single('REQUIRE', 'REQUIRE');
+
+  // delete X…;  — singleton, but record the written identifier for coupling (delete → pop idiom).
+  m = code.match(/^\s*delete\s+([A-Za-z_$][\w.[\]]*)/);
+  if (m) return single('SINGLETON', 'SINGLETON', m[1].split(/[.[]/)[0]);
+
+  // CALL — `callee(args);` of any arity, callee not a control keyword.
+  m = code.match(/^\s*([A-Za-z_][\w.]*)\((.*)\);$/);
+  if (m && !STMT_CALL_CTRL.has(m[1].split('.').pop()!)) {
+    const args = _splitCallArgs(m[2]);
+    if (args) return single('CALL', 'CALL:' + (m[2].trim() === '' ? 0 : args.length));
+  }
+
+  return single('SINGLETON', 'SINGLETON');
+}
+
+function _stmtAlignable(a: StmtNode, b: StmtNode): boolean {
+  return a.cls !== 'SINGLETON' && b.cls !== 'SINGLETON' && a.key === b.key;
+}
+
+function _escRe(s: string): string { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+function _mentions(text: string, ident: string): boolean {
+  return new RegExp(`(?<![\\w$])${_escRe(ident)}(?![\\w$])`).test(text);
+}
+const STMT_SUBJ_SKIP = new Set(['return', 'revert', 'delete', 'emit', 'if', 'for', 'while', 'require', 'assembly']);
+
+// Tight-coupling idioms that canonical leaves glued (no blank), so we must not insert one.
+function _stmtCoupled(prev: StmtNode, cur: StmtNode): boolean {
+  const cf = cur.firstTrim;
+  if (/^_\s*;/.test(cf)) return true;                                   // modifier body `_;`
+
+  if (prev.cls === 'REQUIRE') {
+    if (/^(return|revert)\b/.test(cf)) return true;                     // require → return/revert
+    if (/^if\s*\(.*\)\s*(return|revert)\b/.test(cf)) return true;       // require → single-line guard
+    if (cur.cls === 'ASSIGN' || cur.cls === 'VARDECL') {                // require → decl/assign consuming the checked value
+      const subj = prev.text.match(/require\(\s*([A-Za-z_$][\w.[\]]*)/);
+      if (subj && _mentions(cur.text, subj[1].split(/[.[]/)[0])) return true;
+    }
+  }
+
+  if (prev.writeIdent && _mentions(cur.text, prev.writeIdent)) {
+    if (/^emit\b/.test(cf)) return true;                               // effect → its emit
+    if (/^(return|revert)\b/.test(cf)) return true;                    // value → return/revert of it
+    if (cur.cls === 'ASSIGN' && new RegExp(`^${_escRe(prev.writeIdent)}[.[]`).test(cf)) return true; // element-init
+  }
+
+  // delete X[…] → X.pop() (loop cleanup idiom).
+  if (/^delete\b/.test(prev.firstTrim)) {
+    const curSubj = cf.match(/^([A-Za-z_$]\w*)/);
+    if (curSubj && !STMT_SUBJ_SKIP.has(curSubj[1]) && _mentions(prev.text, curSubj[1])) return true;
+  }
+  return false;
+}
+
+// Classify what kind of body a `{` opens, from the accumulated header text.
+function _braceKind(header: string): 'fn' | 'block' | 'skip' {
+  if (/\b(function|constructor|modifier|fallback|receive)\b/.test(header)) return 'fn';
+  if (/\b(if|else|for|while|do|try|catch|unchecked)\b/.test(header)) return 'block';
+  return 'skip'; // contract/interface/library/struct/enum/assembly/struct-literal/array/etc.
+}
+
+function separateUnalignableStatements(src: string, fixes: string[], isTestFile: boolean): string {
+  if (isTestFile) return src;
+  const lines = src.split('\n');
+  const insertAt = new Set<number>(); // physical line index BEFORE which to insert a blank
+
+  interface Frame { run: boolean; prev: StmtNode | null; sawBlank: boolean }
+  const stack: Frame[] = [{ run: false, prev: null, sawBlank: true }];
+  let inStmt = false;     // a multi-line statement or declaration header is in progress
+  let carry = 0;          // bracket balance within the in-progress statement/header
+  let header = '';        // header text accumulated for the next `{`
+  let leadStart = -1;     // first line of a pending lead-comment block
+  let stmtStart = -1;     // first line of the in-progress multi-line statement
+
+  const codeOf = (l: string) => l.replace(/\/\/.*$/, '').trimEnd();
+
+  const consider = (node: StmtNode, startLine: number, leadLine: number) => {
+    const top = stack[stack.length - 1];
+    if (top.run && top.prev && !top.sawBlank && !_stmtAlignable(top.prev, node) && !_stmtCoupled(top.prev, node)) {
+      insertAt.add(leadLine >= 0 ? leadLine : startLine);
+    }
+    if (top.run) { top.prev = node; top.sawBlank = false; }
+  };
+
+  // Open a block whose header text is `hdr`; the block itself is a singleton in the current frame.
+  const openBlock = (hdr: string, startLine: number, leadLine: number) => {
+    const kind = _braceKind(hdr);
+    consider(_classifyStmt(lines[startLine], true), startLine, leadLine);
+    stack.push({ run: kind !== 'skip', prev: null, sawBlank: true });
+  };
+
+  let i = 0;
+  while (i < lines.length) {
+    const raw = lines[i];
+    const t = raw.trim();
+    const top = stack[stack.length - 1];
+
+    if (t === '') { if (!inStmt) { top.sawBlank = true; leadStart = -1; } i++; continue; }
+
+    if (!inStmt && (t.startsWith('//') || t.startsWith('/*') || t.startsWith('*'))) {
+      if (leadStart === -1) leadStart = i;
+      i++; continue;
+    }
+
+    const code = codeOf(raw);
+    const ct = code.trim();
+
+    // Continuation of a multi-line statement/header. It ends only at a real terminator (`;` or `{`),
+    // NOT merely when parens balance (a signature's `)` is followed by modifiers then `{`).
+    if (inStmt) {
+      carry += _bracketDelta(raw);
+      header += ' ' + code;
+      // Block opener: the trailing `{` is the only unbalanced bracket (a header's parens are closed).
+      // A `{` that leaves carry > 1 is a struct/array literal inside the statement — keep absorbing.
+      if (carry === 1 && ct.endsWith('{')) {
+        carry = 0;
+        openBlock(header, stmtStart, leadStart);
+        inStmt = false; header = ''; leadStart = -1; stmtStart = -1;
+      } else if (carry <= 0 && ct.endsWith(';')) {
+        consider(_classifyStmt(lines[stmtStart], true), stmtStart, leadStart);
+        inStmt = false; carry = 0; header = ''; leadStart = -1; stmtStart = -1;
+      }
+      i++; continue;
+    }
+
+    // Closing brace (possibly `} else {` / `} catch {`).
+    if (ct.startsWith('}')) {
+      if (stack.length > 1) stack.pop();
+      const parent = stack[stack.length - 1];
+      if (parent.run) { parent.prev = _classifyStmt('} ', true); parent.sawBlank = false; } // blank after a block
+      if (ct.endsWith('{')) stack.push({ run: true, prev: null, sawBlank: true }); // reopened block
+      leadStart = -1; header = ''; i++; continue;
+    }
+
+    const delta = _bracketDelta(raw);
+
+    // Single-line block / function opener: `… {` where the `{` is the only unbalanced bracket
+    // (delta === 1). A trailing `{` with delta > 1 (e.g. `x = Foo({`) is a literal — handle as a stmt.
+    if (delta === 1 && ct.endsWith('{')) {
+      openBlock(code, i, leadStart);
+      leadStart = -1; header = ''; i++; continue;
+    }
+
+    // Single-line complete statement.
+    if (delta === 0 && ct.endsWith(';')) {
+      consider(_classifyStmt(raw, false), i, leadStart);
+      leadStart = -1; header = ''; i++; continue;
+    }
+
+    // Otherwise this begins a multi-line statement or declaration header.
+    inStmt = true; carry = delta; header = code; stmtStart = i;
+    i++;
+  }
+
+  if (insertAt.size === 0) return src;
+  const out: string[] = [];
+  for (let k = 0; k < lines.length; k++) {
+    if (insertAt.has(k)) out.push('');
+    out.push(lines[k]);
+  }
+  fixes.push('Separated non-alignable statements');
+  return out.join('\n');
 }
 
 function normalizeDeclBodyBlanks(src: string, fixes: string[], isTestFile: boolean): string {

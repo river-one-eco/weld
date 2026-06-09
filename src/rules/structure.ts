@@ -12,8 +12,6 @@ import type { FunctionDef } from '../sol-types.js';
 // At contract level that means 4-space indent + /.../ of 96 chars.
 // Inside function bodies (8-space indent) that means /.../ of 92 chars.
 const HEADER_TOTAL_LEN = 100;
-// For the formatter we reconstruct using a 96-char stripped border (4-space indent)
-const HEADER_BORDER = '/' + '*'.repeat(94) + '/';
 
 // Ordered list of modifier names (lower index = must come first)
 const MODIFIER_ORDER: string[] = [

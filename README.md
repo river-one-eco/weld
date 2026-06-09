@@ -188,13 +188,19 @@ migration — they're backfilled from defaults on load.
 ## Testing
 
 ```sh
-npm test                 # idempotency gate — format must not change the golden corpus
+npm test                 # idempotency gate (golden corpus) + transformation fixtures
 npm run test:roundtrip   # round-trip recovery — flatten alignment, re-format, measure recovery
 ```
 
-The golden corpus (`test/corpus/`) is a curated set of canonical files spanning the style surface.
-The idempotency gate is the core regression guard: if a formatter change starts altering known-good
-code, it fails. See [`test/run.mjs`](./test/run.mjs).
+Two complementary suites (see [`test/run.mjs`](./test/run.mjs)):
+
+- **Idempotency gate** — the golden corpus (`test/corpus/`) is a curated set of *canonical* files;
+  formatting them must produce **no change**. This guards against drift: if a formatter change starts
+  altering known-good code, it fails.
+- **Transformation fixtures** (`test/fixtures/`) — *messy* `<name>.input.sol` files that must format
+  to their hand-verified `<name>.expected.sol`. These prove weld actually **fixes** bad input (and
+  that each expected output is itself a fixed point). Add a fixture by dropping in an `.input.sol`
+  and its `.expected.sol` (fixtures are formatted with a source path, so source-only rules apply).
 
 ---
 

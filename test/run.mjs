@@ -24,6 +24,7 @@ import { format } from '../dist/formatter.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const CORPUS_DIR = join(HERE, 'corpus');
+const FIXTURES_DIR = join(HERE, 'fixtures');
 
 const RESET = '\x1b[0m', RED = '\x1b[31m', GREEN = '\x1b[32m', YELLOW = '\x1b[33m', DIM = '\x1b[2m';
 
@@ -84,6 +85,39 @@ function runIdempotency(files) {
   return failed === 0;
 }
 
+// Transformation fixtures: messy `*.input.sol` must format to its `*.expected.sol` (and the expected
+// must itself be a fixed point). Formatted with a SOURCE path so source-only rules apply.
+function runFixtures() {
+  let inputs;
+  try {
+    inputs = readdirSync(FIXTURES_DIR).filter(f => f.endsWith('.input.sol')).sort();
+  } catch { inputs = []; }
+  if (inputs.length === 0) return true;
+
+  console.log(`\n${YELLOW}● Transformation fixtures${RESET} (messy input → expected output)\n`);
+  let failed = 0;
+  for (const inFile of inputs) {
+    const name = inFile.replace(/\.input\.sol$/, '');
+    const input = readFileSync(join(FIXTURES_DIR, inFile), 'utf-8');
+    const expected = readFileSync(join(FIXTURES_DIR, `${name}.expected.sol`), 'utf-8');
+    const got = format(input, 'src/Fixture.sol').content;
+    const stable = format(expected, 'src/Fixture.sol').content === expected;
+    if (got === expected && stable) {
+      console.log(`  ${GREEN}✓ ${name}${RESET}`);
+    } else {
+      failed++;
+      if (got !== expected) {
+        console.log(`  ${RED}✗ ${name}${RESET} — formatted output ≠ expected:`);
+        showDiff(expected, got);
+      }
+      if (!stable) console.log(`  ${RED}✗ ${name}${RESET} — expected output is not a fixed point`);
+    }
+  }
+  if (failed === 0) console.log(`\n${GREEN}✓ all ${inputs.length} fixtures format to expected${RESET}`);
+  else console.log(`\n${RED}✗ ${failed}/${inputs.length} fixtures failed${RESET}`);
+  return failed === 0;
+}
+
 function runRoundtrip(files) {
   console.log(`\n${YELLOW}● Round-trip recovery${RESET} (flatten → format → compare)\n`);
   let totalLines = 0, totalRecovered = 0;
@@ -116,7 +150,10 @@ const roundtrip = args.includes('--roundtrip');
 const all = args.includes('--all');
 
 let ok = true;
-if (!roundtrip || all) ok = runIdempotency(files);
+if (!roundtrip || all) {
+  ok = runIdempotency(files);
+  ok = runFixtures() && ok;
+}
 if (roundtrip || all) runRoundtrip(files);
 
 process.exit(ok ? 0 : 1);
